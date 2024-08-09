@@ -1,10 +1,12 @@
-addEventListener('fetch', event => {
-	event.respondWith(handleRequest(event.request, event));
-})
+export default {
+	async fetch(request, env, ctx) {
+		return await handleRequest(request, env, ctx);
+	}
+}
 
-async function handleRequest (request, event) {
+async function handleRequest (request, env, ctx) {
 	// Implement rate limiting using Cloudflare D1
-	const rateLimitResponse = await applyRateLimit(request);
+	const rateLimitResponse = await applyRateLimit(request, env);
 	if (rateLimitResponse) {
 		return rateLimitResponse;
 	}
@@ -16,20 +18,20 @@ async function handleRequest (request, event) {
 	}
 
 	response = await fetch(request)
-	const responseClone = response.clone();
 
 	if (!response.ok) {
-		return customErrorPage(response.status);
+		return customErrorPage(response.status, request);
 	}
 
 	// Security Headers
-	//response.headers.set('Strict-Transport-Security','max-age=31536000; includeSubDomains; preload');
-	response.headers.set('X-Content-Type-Options', 'nosniff');
-	response.headers.set('X-Frame-Options', 'DENY');
-	//response.headers.set('Content-Security-Policy',"default-src 'self'; script-src 'self' https://trusted.cdn.com; style-src 'self' https://trusted.cdn.com; img-src 'self' data:;");
-	response.headers.set('Referrer-Policy', 'no-referrer-when-downgrade');
-	response.headers.set("X-XSS-Protection", "1; mode=block");
-	response.headers.set("Access-Control-Allow-Origin", "*");
+	const responseHeaders = new Headers(response.headers);
+	//responseHeaders.set('Strict-Transport-Security','max-age=31536000; includeSubDomains; preload');
+	responseHeaders.set('X-Content-Type-Options', 'nosniff');
+	responseHeaders.set('X-Frame-Options', 'DENY');
+	//responseHeaders.set('Content-Security-Policy',"default-src 'self'; script-src 'self' https://trusted.cdn.com; style-src 'self' https://trusted.cdn.com; img-src 'self' data:;");
+	responseHeaders.set('Referrer-Policy', 'no-referrer-when-downgrade');
+	responseHeaders.set("X-XSS-Protection", "1; mode=block");
+	responseHeaders.set("Access-Control-Allow-Origin", "*");
 
 	const url = new URL(request.url);
 	const pathname = url.pathname;
@@ -59,7 +61,7 @@ async function handleRequest (request, event) {
 		cacheOptions.browserTTL = 0;
 	}
 
-	const originCacheControl = responseClone.headers.get('Cache-Control')
+	const originCacheControl = response.headers.get('Cache-Control')
 	if (originCacheControl) {
 		const maxAgeMatch = originCacheControl.match(/max-age=(\d+)/);
 		if (maxAgeMatch) {
@@ -68,17 +70,24 @@ async function handleRequest (request, event) {
 		cacheOptions.edgeTTL = cacheOptions.browserTTL > cacheOptions.edgeTTL ? cacheOptions.browserTTL	: cacheOptions.edgeTTL;
 	}
 
-	event.waitUntil(cache.put(request, responseClone))
-	response = new Response(responseClone.body, responseClone);
-	response.headers.set('Cache-Control',`public, max-age=${cacheOptions.browserTTL}`);
+	const modifiedResponse = new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: responseHeaders
+	});
 
-	return response;
+	// Use ctx.waitUntil to cache the response
+	ctx.waitUntil(cache.put(request, modifiedResponse.clone()));
+
+	modifiedResponse.headers.set("Cache-Control", `public, max-age=${cacheOptions.browserTTL}`);
+
+	return modifiedResponse;
 }
 
 // Rate Limiting using Cloudflare D1
-async function applyRateLimit (request) {
+async function applyRateLimit (request, env) {
 	const rateLimitKey = `${request.headers.get('cf-connecting-ip')}:${request.url}`;
-	const limit = 15; // Define your rate limit
+	let limit = 15; // Define your rate limit
 	const ttl = 60; // Time window in seconds
 
 	const url = request.url;;
@@ -87,7 +96,7 @@ async function applyRateLimit (request) {
 	}	
 
 	// Fetch existing rate limit data from D1
-	const result = await RATE_LIMIT_DB.prepare(
+	const result = await env.RATE_LIMIT_DB.prepare(
 		'SELECT count, timestamp FROM rate_limit WHERE id = ?'
 	)
 	.bind(rateLimitKey).first();
@@ -110,12 +119,12 @@ async function applyRateLimit (request) {
 
 	// Update or insert the new count in D1
 	if (result) {
-		await RATE_LIMIT_DB.prepare(
+		await env.RATE_LIMIT_DB.prepare(
 			'UPDATE rate_limit SET count = ?, timestamp = ? WHERE id = ?'
 		)
 		.bind(currentCount + 1, now, rateLimitKey).run();
 	} else {
-		await RATE_LIMIT_DB.prepare(
+		await env.RATE_LIMIT_DB.prepare(
 			'INSERT INTO rate_limit (id, count, timestamp) VALUES (?, ?, ?)'
 		)
 		.bind(rateLimitKey, 1, now).run();
@@ -237,20 +246,20 @@ function customErrorPage (status, request) {
 
 					.error-container .error-message {
 						font-size: 1.4rem;
-						color: #333;
+						color: #173F58;
 						font-weight: 700;
 						text-align: center;
 					}
 
 					.error-container .error-details {
 						font-size: 1.2rem;
-						color: #666;
+						color: #172839;
 						font-weight: 500;
 						margin-top: 1em;
 					}
 
 					.error-container .error-details b {
-						color: #333;
+						color: #173F58;
 					}
 
 					.toggle-container {
@@ -292,7 +301,7 @@ function customErrorPage (status, request) {
 
 					<div class="error-container">
 						<div class="error-message">${statusText}</div>
-						<div class="error-details"><b>Status:</b>${status} - ${message}</div>
+						<div class="error-details"><b>Status:</b> ${status} - ${message}</div>
 						<div class="error-details"><b>URL:</b> ${url}</div>
 						<div class="error-details"><b>Time:</b> ${timestamp}</div>
 						<div class="error-details"><b>User Agent:</b> ${userAgent}</div>

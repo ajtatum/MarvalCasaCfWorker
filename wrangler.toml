@@ -2,4 +2,5 @@ name = "marvelcasacfworker"
 compatibility_date = "2024-08-09"
 [[d1_databases]]
 binding = "RATE_LIMIT_DB"
+database_id = "d0d1df8c-4a10-4aa5-8da0-fc575748bc52"
 database_name = "marvelcasadb"
