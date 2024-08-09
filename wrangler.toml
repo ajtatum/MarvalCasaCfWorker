@@ -1,0 +1,5 @@
+name = "marvelcasacfworker"
+compatibility_date = "2024-08-09"
+[[d1_databases]]
+binding = "RATE_LIMIT_DB"
+database_name = "marvelcasadb"

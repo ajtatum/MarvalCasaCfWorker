@@ -1,0 +1,14 @@
+{
+  "name": "marvelcasacfworker",
+  "version": "0.0.0",
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "wrangler": "3.70.0"
+  },
+  "private": true,
+  "scripts": {
+    "start": "wrangler dev src/index.js",
+    "deploy": "wrangler deploy src/index.js",
+    "test": "jest"
+  }
+}
