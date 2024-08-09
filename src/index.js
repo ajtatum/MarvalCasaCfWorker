@@ -19,7 +19,7 @@ async function handleRequest (request, env, ctx) {
 
 	response = await fetch(request)
 
-	if (!response.ok) {
+	if (response.status >= 400 && response.status < 600) {
 		return customErrorPage(response.status, request);
 	}
 
