@@ -1,30 +1,163 @@
 export default {
 	async fetch(request, env, ctx) {
+		const url = new URL(request.url);
+
+		// Handle the cache clearing endpoint
+		if (url.pathname === '/clear-cache') {
+			return await clearCache(request, env);
+		}
+
 		return await handleRequest(request, env, ctx);
 	}
 }
 
-async function handleRequest (request, env, ctx) {
+// Function to handle the cache clearing endpoint
+async function clearCache(request, env) {
+	const url = new URL(request.url);
+	const subdomain = url.searchParams.get('subdomain');
+
+	if (!subdomain) {
+		return new Response('Subdomain is required', {
+			status: 400
+		});
+	}
+
+	if (!url.searchParams.get('token') || url.searchParams.get('token') !== `${env.CLEAR_CACHE_TOKEN}`) {
+		return new Response('Unauthorized', {
+			status: 401
+		});
+	}
+
+	const cache = caches.default;
+	const cacheKeys = await cache.keys();
+
+	// Filter and delete cached items related to the specific subdomain
+	for (const cacheKey of cacheKeys) {
+		const cacheUrl = new URL(cacheKey.url);
+		if (cacheUrl.hostname === `${subdomain}.marvel.casa`) {
+			await cache.delete(cacheKey);
+		}
+	}
+
+	return new Response(`Cache cleared for ${subdomain}.marvel.casa`, {
+		status: 200
+	});
+}
+
+// Main function to handle regular requests
+async function handleRequest(request, env, ctx) {
+	const url = new URL(request.url);
+
+	// Handle WebSocket Upgrade
+	if (request.headers.get('Upgrade') === 'websocket') {
+		return handleWebSocket(request);
+	}
+
 	// Implement rate limiting using Cloudflare D1
 	const rateLimitResponse = await applyRateLimit(request, env);
 	if (rateLimitResponse) {
 		return rateLimitResponse;
 	}
 
+	// Skip Cloudflare caching for the auth.marvel.casa domain
+	if (url.hostname === 'auth.marvel.casa') {
+		let response = await fetch(request);
+		response = await handleCacheTTL(response, url.pathname);
+		return await compressResponse(request, response);
+	}
+
+	// Continue with caching logic for other domains
 	const cache = caches.default;
 	let response = await cache.match(request);
 	if (response) {
+		console.log(`Cache hit for ${request.url}`);
 		return response;
 	}
 
-	response = await fetch(request)
+	response = await fetch(request);
+	ctx.waitUntil(cache.put(request, response.clone()));
 
-	if (response.status >= 400 && response.status < 600) {
-		return customErrorPage(response.status, request);
+	// Apply custom error pages for errors in the 400–599 range
+	response = await handleErrorResponse(response, request);
+
+	// Apply caching TTL and compression before returning the response
+	response = await handleCacheTTL(response, url.pathname);
+	return await compressResponse(request, response);
+}
+
+// Function to handle caching TTL (edge and browser) considering Cache-Control header
+async function handleCacheTTL(response, url) {
+	const responseHeaders = new Headers(response.headers);
+
+	// Set default cache options
+	let cacheOptions = {
+		edgeTTL: 86400, // Default to 1 day
+		browserTTL: 3600 // Default to 1 hour
+	};
+
+	// set static cache options
+	let staticCacheOptions = {
+		edgeTTL: 604800, // 1 week
+		browserTTL: 86400 // 1 day
+	};
+
+	// Dynamic content handling (assuming dynamic content can be identified by URL patterns or query params)
+	if (url.searchParams.has("nocache") || pathname.includes("/dynamic/")) {
+		// Bypass cache for dynamic content
+		cacheOptions.edgeTTL = 0;
+		cacheOptions.browserTTL = 0;
 	}
 
-	// Security Headers
-	const responseHeaders = new Headers(response.headers);
+	const originCacheControl = responseHeaders.get("Cache-Control");
+
+	if (originCacheControl) {
+		// Parse Cache-Control header from the origin
+		const cacheControlDirectives = originCacheControl.split(',').map(directive => directive.trim());
+
+		if (cacheControlDirectives.includes("no-store")) {
+			// Do not cache at all
+			responseHeaders.set('Cache-Control', 'no-store');
+			return new Response(response.body, {
+				status: response.status,
+				statusText: response.statusText,
+				headers: responseHeaders,
+			});
+		}
+
+		if (cacheControlDirectives.includes("no-cache") || cacheControlDirectives.includes("private")) {
+			// Cache only at the edge, not in the browser
+			cacheOptions.edgeTTL = 0;
+			cacheOptions.browserTTL = 0;
+		}
+
+		// Check for max-age directive
+		const maxAgeDirective = cacheControlDirectives.find(directive => directive.startsWith("max-age="));
+		if (maxAgeDirective) {
+			const maxAge = parseInt(maxAgeDirective.split("=")[1], 10);
+			cacheOptions.browserTTL = maxAge; // Use max-age from the origin for browser TTL
+			cacheOptions.edgeTTL = Math.max(cacheOptions.edgeTTL, maxAge); // Use max-age from the origin if longer than the default edge TTL
+		}
+	} else {
+		const pathname = url.pathname;
+
+		// Determine TTL based on the type of content if no Cache-Control header is present
+		if (pathname.endsWith(".html")) {
+			cacheOptions.edgeTTL = 3600; // Cache HTML for 1 hour at the edge
+			cacheOptions.browserTTL = 1800; // Cache HTML for 30 minutes in the browser
+		} else if (pathname.endsWith(".css")) {
+			cacheOptions.edgeTTL = staticCacheOptions.edgeTTL;
+			cacheOptions.browserTTL = staticCacheOptions.browserTTL;
+		} else if (pathname.endsWith(".js")) {
+			cacheOptions.edgeTTL = staticCacheOptions.edgeTTL;
+			cacheOptions.browserTTL = staticCacheOptions.browserTTL;
+		} else if (pathname.endsWith(".png") || pathname.endsWith(".jpg") || pathname.endsWith(".jpeg") || pathname.endsWith(".gif") || pathname.endsWith(".webp")) {
+			cacheOptions.edgeTTL = staticCacheOptions.edgeTTL;
+			cacheOptions.browserTTL = staticCacheOptions.browserTTL;
+		}
+	}
+
+	// Set the Cache-Control header for the browser
+	responseHeaders.set("Cache-Control", `public, max-age=${cacheOptions.browserTTL}`);
 	//responseHeaders.set('Strict-Transport-Security','max-age=31536000; includeSubDomains; preload');
 	responseHeaders.set('X-Content-Type-Options', 'nosniff');
 	responseHeaders.set('X-Frame-Options', 'DENY');
@@ -33,79 +166,166 @@ async function handleRequest (request, env, ctx) {
 	responseHeaders.set("X-XSS-Protection", "1; mode=block");
 	responseHeaders.set("Access-Control-Allow-Origin", "*");
 
-	const url = new URL(request.url);
-	const pathname = url.pathname;
-	let cacheOptions = {
-		edgeTTL: 86400, // Default to 1 day TTL
-		browserTTL: 3600 // Default to 1 hour TTL
-	};
-
-	if (pathname.endsWith(".html")) {
-		cacheOptions.edgeTTL = 3600; // Cache for 1 hour at the edge
-		cacheOptions.browserTTL = 1800; // Cache for 30 minutes in the browser
-	} else if (pathname.endsWith(".css")) {
-		cacheOptions.edgeTTL = 604800;
-		cacheOptions.browserTTL = 86400;
-	} else if (pathname.endsWith(".js")) {
-		cacheOptions.edgeTTL = 604800;
-		cacheOptions.browserTTL = 86400;
-	} else if (pathname.endsWith(".png") || pathname.endsWith(".jpg") || pathname.endsWith(".jpeg") || pathname.endsWith(".gif") || pathname.endsWith(".webp")) {
-		cacheOptions.edgeTTL = 604800;
-		cacheOptions.browserTTL = 86400;
-	}
-
-	// Dynamic content handling (assuming dynamic content can be identified by URL patterns or query params)
-	if (url.searchParams.has("nocache") || pathname.includes("/dynamic/")) {
-    	// Bypass cache for dynamic content
-		cacheOptions.edgeTTL = 0;
-		cacheOptions.browserTTL = 0;
-	}
-
-	const originCacheControl = response.headers.get('Cache-Control')
-	if (originCacheControl) {
-		const maxAgeMatch = originCacheControl.match(/max-age=(\d+)/);
-		if (maxAgeMatch) {
-			cacheOptions.browserTTL = parseInt(maxAgeMatch[1], 10);
-		}
-		cacheOptions.edgeTTL = cacheOptions.browserTTL > cacheOptions.edgeTTL ? cacheOptions.browserTTL	: cacheOptions.edgeTTL;
-	}
-
+	// Set the edge cache TTL using the cf object
 	const modifiedResponse = new Response(response.body, {
 		status: response.status,
 		statusText: response.statusText,
-		headers: responseHeaders
+		headers: responseHeaders,
 	});
-
-	// Use ctx.waitUntil to cache the response
-	ctx.waitUntil(cache.put(request, modifiedResponse.clone()));
-
-	modifiedResponse.headers.set("Cache-Control", `public, max-age=${cacheOptions.browserTTL}`);
 
 	return modifiedResponse;
 }
 
+// Function to handle response compression
+async function compressResponse(request, response) {
+	const acceptEncoding = request.headers.get('Accept-Encoding') || '';
+	const contentType = response.headers.get('Content-Type') || '';
+
+	// Determine if we should compress based on Content-Type
+	const shouldCompress = contentType.startsWith('text/') ||
+		contentType.includes('javascript') ||
+		contentType.includes('json') ||
+		contentType.includes('css') ||
+		contentType.includes('xml');
+
+	if (!shouldCompress) {
+		// Skip compression for non-text content like images, videos, etc.
+		return response;
+	}
+
+	let contentEncoding = '';
+	let compressedBody;
+
+	// Apply Brotli compression if supported
+	if (acceptEncoding.includes('br')) {
+		contentEncoding = 'br';
+		compressedBody = await compressWithBrotli(await response.text());
+	} else if (acceptEncoding.includes('gzip')) {
+		// Apply Gzip compression if supported
+		contentEncoding = 'gzip';
+		compressedBody = await compressWithGzip(await response.text());
+	} else if (acceptEncoding.includes('deflate')) {
+		// Apply Deflate compression if supported
+		contentEncoding = 'deflate';
+		compressedBody = await compressWithDeflate(await response.text());
+	} else {
+		// No compression supported
+		return response;
+	}
+
+	// Return compressed response
+	return new Response(compressedBody, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: {
+			...Object.fromEntries(response.headers),
+			'Content-Encoding': contentEncoding,
+			'Vary': 'Accept-Encoding', // To ensure correct caching based on encoding
+		},
+	});
+}
+
+// Placeholder functions for compression algorithms (implement as needed)
+async function compressWithBrotli(text) {
+	// Use a Brotli compression library to compress the text
+	// e.g., using zlib in a Node.js environment, or a WebAssembly module for Workers
+	// This is a placeholder
+	return new TextEncoder().encode(text); // Replace with actual Brotli compression
+}
+
+async function compressWithGzip(text) {
+	// Use a Gzip compression library to compress the text
+	// This is a placeholder
+	return new TextEncoder().encode(text); // Replace with actual Gzip compression
+}
+
+async function compressWithDeflate(text) {
+	// Use a Deflate compression library to compress the text
+	// This is a placeholder
+	return new TextEncoder().encode(text); // Replace with actual Deflate compression
+}
+
+// Handle WebSocket Upgrade
+function handleWebSocket(request) {
+	const upgradeHeader = request.headers.get('Upgrade');
+	if (upgradeHeader !== 'websocket') {
+		return new Response('Expected WebSocket upgrade', {
+			status: 426
+		});
+	}
+
+	const [client, server] = new WebSocketPair();
+	server.accept();
+
+	// Handle the WebSocket connection on the server side
+	server.addEventListener('message', event => {
+		server.send(`${event.data}`);
+	});
+
+	return new Response(null, {
+		status: 101,
+		webSocket: client,
+	});
+}
+
+// Apply custom error handling for HTTP status codes 400–599
+async function handleErrorResponse(response, request) {
+	if (response.status >= 400 && response.status < 600) {
+		return customErrorPage(response.status, request);
+	}
+	return response;
+}
+
 // Rate Limiting using Cloudflare D1
-async function applyRateLimit (request, env) {
-	const rateLimitKey = `${request.headers.get('cf-connecting-ip')}:${request.url}`;
-	let limit = 15; // Define your rate limit
+async function applyRateLimit(request, env) {
+	const url = new URL(request.url);
+
+	// Check if the request is from another subdomain of marvel.casa
+	const origin = request.headers.get('Origin');
+	const referer = request.headers.get('Referer');
+
+	if (origin || referer) {
+		const originURL = new URL(origin || referer);
+		if (originURL.hostname.endsWith('.marvel.casa') && originURL.hostname !== url.hostname) {
+			// Bypass rate limiting for cross-subdomain requests within marvel.casa
+			return null;
+		}
+	}
+
+	let rateLimitKey;
+	let limit = 15; // Default rate limit
 	const ttl = 60; // Time window in seconds
 
-	const url = request.url;;
+	// Check if the request has an API key
+	const apiKey = request.headers.get('x-api-key');
+	if (apiKey) {
+		rateLimitKey = `apiKey:${apiKey}`;
+	} else {
+		// Fallback to IP address
+		const ipAddress = request.headers.get('cf-connecting-ip');
+		rateLimitKey = `ip:${ipAddress}`;
+	}
+
 	if (url.includes("https://metrics.tech.marvel.casa/js/plausible") || url.includes("https://metrics.tech.marvel.casa/api/event")) {
 		limit = 100; // Higher rate limit for specific URLs
-	}	
+	} else if (url.includes("auth.marvel.casa")) {
+		limit = 10; // Lower rate limit for specific URLs
+	}
 
 	// Fetch existing rate limit data from D1
 	const result = await env.RATE_LIMIT_DB.prepare(
-		'SELECT count, timestamp FROM rate_limit WHERE id = ?'
-	)
-	.bind(rateLimitKey).first();
+			'SELECT count, timestamp FROM rate_limit WHERE id = ?'
+		)
+		.bind(rateLimitKey).first();
 
 	let currentCount = 0;
 	const now = Math.floor(Date.now() / 1000);
 
 	if (result) {
-		const { count, timestamp } = result;
+		const {
+			count,
+			timestamp
+		} = result;
 		if (now - timestamp < ttl) {
 			currentCount = count;
 		} else {
@@ -114,27 +334,32 @@ async function applyRateLimit (request, env) {
 	}
 
 	if (currentCount >= limit) {
-		return new Response('Too many requests', { status: 429 });
+		return new Response('Too many requests. Please wait before trying again.', {
+			status: 429,
+			headers: {
+				'Retry-After': String(ttl)
+			},
+		});
 	}
 
 	// Update or insert the new count in D1
 	if (result) {
 		await env.RATE_LIMIT_DB.prepare(
-			'UPDATE rate_limit SET count = ?, timestamp = ? WHERE id = ?'
-		)
-		.bind(currentCount + 1, now, rateLimitKey).run();
+				'UPDATE rate_limit SET count = ?, timestamp = ? WHERE id = ?'
+			)
+			.bind(currentCount + 1, now, rateLimitKey).run();
 	} else {
 		await env.RATE_LIMIT_DB.prepare(
-			'INSERT INTO rate_limit (id, count, timestamp) VALUES (?, ?, ?)'
-		)
-		.bind(rateLimitKey, 1, now).run();
+				'INSERT INTO rate_limit (id, count, timestamp) VALUES (?, ?, ?)'
+			)
+			.bind(rateLimitKey, 1, now).run();
 	}
 
 	// No rate limit exceeded, proceed with request handling
 	return null;
 }
 
-function customErrorPage (status, request) {
+function customErrorPage(status, request) {
 	const errorPages = {
 		400: 'Bad Request',
 		401: 'Unauthorized',
@@ -145,7 +370,7 @@ function customErrorPage (status, request) {
 		502: 'Bad Gateway',
 		503: 'Service Unavailable',
 		504: 'Gateway Timeout'
-	// Add more custom pages as needed
+		// Add more custom pages as needed
 	};
 	const statusTexts = {
 		400: "Oops, did you send a jumbled mess? The server is having a meltdown trying to understand it. Maybe try again with some clarity?",
@@ -166,7 +391,7 @@ function customErrorPage (status, request) {
 	const userAgent = request.headers.get('User-Agent');
 	const referer = request.headers.get('Referer') || 'No referrer';
 
-  	// Cloudflare-specific variables
+	// Cloudflare-specific variables
 	const ipAddress = request.headers.get('cf-connecting-ip') || 'Unknown IP';
 	const country = request.headers.get('cf-ipcountry') || 'Unknown country';
 	const rayId = request.headers.get('cf-ray') || 'No Ray ID';
